@@ -62,7 +62,7 @@ def set_seed(seed: int) -> jax.Array:
     return jax.random.PRNGKey(seed)
 
 
-def torch_batch_to_jax(batch: Dict[str, Any]) -> Batch:
+def torch_to_jax(batch: Dict[str, Any]) -> Batch:
     input_ids = jnp.asarray(batch["input_ids"].cpu().numpy(), dtype=jnp.int32)
     attention_mask = jnp.asarray(batch["attention_mask"].cpu().numpy(), dtype=jnp.bool_)
     example_ids = jnp.asarray(batch["example_ids"].cpu().numpy(), dtype=jnp.int32)
@@ -76,47 +76,28 @@ def torch_batch_to_jax(batch: Dict[str, Any]) -> Batch:
     }
 
 
-def make_weight_decay_mask(model: eqx.Module) -> Any:
-    def _path_attr_names(path) -> Tuple[str, ...]:
-        names = []
-        for k in path:
-            if hasattr(k, "name"):
-                names.append(str(k.name))
-            elif hasattr(k, "key"):
-                names.append(str(k.key))
-            elif hasattr(k, "idx"):
-                names.append(str(k.idx))
-            else:
-                names.append(str(k))
-        return tuple(names)
-
+def make_weight_decay_mask(model: eqx.Module):
     params = eqx.filter(model, eqx.is_inexact_array)
     flat, treedef = jax.tree_util.tree_flatten_with_path(params)
 
-    mask_flat = []
+    mask = []
     for path, leaf in flat:
         if leaf is None:
-            mask_flat.append(False)
+            mask.append(False)
             continue
 
-        names = _path_attr_names(path)
-        last = names[-1] if names else ""
-        in_attention = ("attention" in names) or ("attn" in names)
-
-        in_embedding = ("token_embedding" in names) or ("example_embedding" in names)
-        is_bias = last == "bias"
-        is_weight = last == "weight"
-
-        decay = bool(
-            is_weight
-            and (leaf.ndim >= 2)
-            and (not in_attention)
-            and (not in_embedding)
-            and (not is_bias)
+        p = jax.tree_util.keystr(path)
+        decay = (
+            p.endswith(".weight")
+            and leaf.ndim >= 2
+            and ".attn" not in p
+            and ".attention" not in p
+            and ".token_embedding" not in p
+            and ".example_embedding" not in p
         )
-        mask_flat.append(decay)
+        mask.append(decay)
 
-    return jax.tree_util.tree_unflatten(treedef, mask_flat)
+    return jax.tree_util.tree_unflatten(treedef, mask)
 
 
 def make_train_step(optimizer: optax.GradientTransformation):
@@ -247,7 +228,7 @@ def main(cfg: TrainConfig) -> None:
             ):
                 if color_aug.num_permutations > 0:
                     augment_color(batch, color_augmentor=color_aug)
-            jbatch = torch_batch_to_jax(batch)
+            jbatch = torch_to_jax(batch)
 
             t_step_start = time.perf_counter()
             model, opt_state, metrics, key = train_step(model, opt_state, jbatch, key)
@@ -291,7 +272,7 @@ def main(cfg: TrainConfig) -> None:
                 if not any(batch.get("has_output", [True])):
                     continue
 
-                jbatch = torch_batch_to_jax(batch)
+                jbatch = torch_to_jax(batch)
                 metrics = val_step(model, jbatch)
                 val_sums = (
                     jax.tree.map(lambda a, b: a + b, val_sums, metrics)

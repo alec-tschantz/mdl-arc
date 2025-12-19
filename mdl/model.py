@@ -157,7 +157,7 @@ def compute_loss(
     correct_tokens = (
         jnp.logical_and(valid_mask, preds == shift_targets).sum().astype(jnp.float32)
     )
-    token_accuracy = correct_tokens / jnp.maximum(total_valid, 1.0)
+    correct_tokens = correct_tokens / jnp.maximum(total_valid, 1.0)
 
     per_example_valid = valid_mask.sum(axis=1)
     per_example_has_valid = per_example_valid > 0
@@ -170,7 +170,7 @@ def compute_loss(
         .astype(jnp.float32)
     )
     exact_total = per_example_has_valid.sum().astype(jnp.float32)
-    puzzle_accuracy = exact_correct / jnp.maximum(exact_total, 1.0)
+    correct_puzzles = exact_correct / jnp.maximum(exact_total, 1.0)
 
     shift_input_ids = input_ids[:, :-1].astype(jnp.int32)
     is_output_phase = jnp.cumsum(shift_input_ids == IO_SEPARATOR_TOKEN_ID, axis=1) >= 1
@@ -183,11 +183,50 @@ def compute_loss(
     input_loss = (raw_losses * valid_input.astype(jnp.float32)).sum() / input_denom
     output_loss = (raw_losses * valid_output.astype(jnp.float32)).sum() / output_denom
 
+    correct_input_tokens = (
+        jnp.logical_and(valid_input, preds == shift_targets).sum().astype(jnp.float32)
+    )
+    correct_output_tokens = (
+        jnp.logical_and(valid_output, preds == shift_targets).sum().astype(jnp.float32)
+    )
+    correct_input_tokens = correct_input_tokens / input_denom
+    correct_output_tokens = correct_output_tokens / output_denom
+
+    per_example_input_valid = valid_input.sum(axis=1)
+    per_example_input_has_valid = per_example_input_valid > 0
+    per_example_input_all_correct = jnp.all(
+        jnp.logical_or(~valid_input, preds == shift_targets), axis=1
+    )
+    input_exact_correct = (
+        jnp.logical_and(per_example_input_has_valid, per_example_input_all_correct)
+        .sum()
+        .astype(jnp.float32)
+    )
+    input_exact_total = per_example_input_has_valid.sum().astype(jnp.float32)
+    correct_input_puzzles = input_exact_correct / jnp.maximum(input_exact_total, 1.0)
+
+    per_example_output_valid = valid_output.sum(axis=1)
+    per_example_output_has_valid = per_example_output_valid > 0
+    per_example_output_all_correct = jnp.all(
+        jnp.logical_or(~valid_output, preds == shift_targets), axis=1
+    )
+    output_exact_correct = (
+        jnp.logical_and(per_example_output_has_valid, per_example_output_all_correct)
+        .sum()
+        .astype(jnp.float32)
+    )
+    output_exact_total = per_example_output_has_valid.sum().astype(jnp.float32)
+    correct_output_puzzles = output_exact_correct / jnp.maximum(output_exact_total, 1.0)
+
     metrics = {
         "loss": loss,
         "input_loss": input_loss,
         "output_loss": output_loss,
-        "percent_correct_tokens": token_accuracy,
-        "percent_correct_puzzles": puzzle_accuracy,
+        "correct_tokens": correct_tokens,
+        "correct_puzzles": correct_puzzles,
+        "correct_input_tokens": correct_input_tokens,
+        "correct_input_puzzles": correct_input_puzzles,
+        "correct_output_tokens": correct_output_tokens,
+        "correct_output_puzzles": correct_output_puzzles,
     }
     return logits, metrics
