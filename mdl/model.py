@@ -1,14 +1,13 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import Dict, Optional, Tuple, TypedDict
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int
 
 from .dataset import IO_SEPARATOR_TOKEN_ID, IGNORE_INDEX, MAX_SEQ_LEN, VOCAB_SIZE
-from .nn import Embedding, LayerNorm, LinearNoBias, TransformerBlock
+from .nn import Embedding, LayerNorm, Linear, TransformerBlock
 
 
 @dataclass(frozen=True)
@@ -23,21 +22,15 @@ class ModelConfig:
     num_examples: int = 1280
     dtype: jnp.dtype = jnp.bfloat16
 
-    def __post_init__(self) -> None:
-        if self.d_model % self.n_heads != 0:
-            raise ValueError("d_model must be divisible by n_heads.")
-        if self.n_layers < 1:
-            raise ValueError("n_layers must be >= 1.")
-        if self.num_examples < 1:
-            raise ValueError("num_examples must be >= 1.")
+
+class Batch(TypedDict):
+    input_ids: Int[Array, "B S"]
+    attention_mask: Bool[Array, "B S"]
+    example_ids: Int[Array, "B"]
+    positions_3d: Int[Array, "B S 3"]
 
 
-class ModelOutput(NamedTuple):
-    logits: jax.Array
-    loss: jax.Array
-    input_loss: jax.Array
-    output_loss: jax.Array
-    num_output_tokens: jax.Array
+Metrics = Dict[str, Float[Array, ""]]
 
 
 class Model(eqx.Module):
@@ -49,7 +42,7 @@ class Model(eqx.Module):
 
     blocks: Tuple[TransformerBlock, ...]
     norm: LayerNorm
-    lm_head: LinearNoBias
+    lm_head: Linear
 
     def __init__(self, cfg: ModelConfig, *, key: jax.Array):
         self.config = cfg
@@ -63,25 +56,24 @@ class Model(eqx.Module):
         self.blocks = tuple(TransformerBlock(cfg, key=kk) for kk in keys)
 
         self.norm = LayerNorm(cfg.d_model)
-        self.lm_head = LinearNoBias(
-            cfg.d_model, cfg.vocab_size, key=k_head, dtype=cfg.dtype
+        self.lm_head = Linear(
+            cfg.d_model, cfg.vocab_size, key=k_head, dtype=cfg.dtype, bias=False
         )
 
     def __call__(
         self,
-        input_ids: jax.Array,
-        example_ids: jax.Array,
+        input_ids: Int[Array, "B S"],
+        example_ids: Int[Array, "B"],
         *,
-        attention_mask: Optional[jax.Array] = None,
-        positions_3d: Optional[jax.Array] = None,
+        positions_3d: Int[Array, "B S 3"],
+        attention_mask: Optional[Bool[Array, "B S"]] = None,
         key: Optional[jax.Array] = None,
         inference: bool = False,
-    ) -> jax.Array:
+    ) -> Float[Array, "B S V"]:
         B, S = input_ids.shape
-        if S > self.config.max_seq_len:
-            raise ValueError(
-                f"Sequence length {S} exceeds model capacity ({self.config.max_seq_len})."
-            )
+        assert (
+            S <= self.config.max_seq_len
+        ), f"Sequence length {S} exceeds model capacity ({self.config.max_seq_len})."
 
         inference = inference or (key is None)
         if attention_mask is None:
@@ -89,10 +81,6 @@ class Model(eqx.Module):
         else:
             attention_mask = attention_mask.astype(jnp.bool_)
 
-        if positions_3d is None:
-            raise ValueError(
-                "positions_3d must be provided (precomputed) for this JAX implementation."
-            )
         pos_xyz = positions_3d.astype(jnp.int32)
 
         tok = self.token_embedding(input_ids.astype(jnp.int32))
@@ -122,7 +110,9 @@ class Model(eqx.Module):
         return logits
 
 
-def _cross_entropy_per_token(logits: jax.Array, targets: jax.Array) -> jax.Array:
+def _cross_entropy_per_token(
+    logits: Float[Array, "B T V"], targets: Int[Array, "B T"]
+) -> Float[Array, "B T"]:
     logits_f = logits.astype(jnp.float32)
     logp = jax.nn.log_softmax(logits_f, axis=-1)
 
@@ -136,11 +126,11 @@ def _cross_entropy_per_token(logits: jax.Array, targets: jax.Array) -> jax.Array
 
 def compute_loss(
     model: Model,
-    batch: Dict[str, jax.Array],
+    batch: Batch,
     *,
     key: Optional[jax.Array] = None,
     inference: bool = False,
-) -> ModelOutput:
+) -> Tuple[Float[Array, "B S V"], Metrics]:
     logits = model(
         batch["input_ids"],
         batch["example_ids"],
@@ -163,24 +153,41 @@ def compute_loss(
     total_valid = valid_mask.sum().astype(jnp.float32)
     loss = raw_losses.sum() / jnp.maximum(total_valid, 1.0)
 
+    preds = jnp.argmax(shift_logits, axis=-1).astype(jnp.int32)
+    correct_tokens = (
+        jnp.logical_and(valid_mask, preds == shift_targets).sum().astype(jnp.float32)
+    )
+    token_accuracy = correct_tokens / jnp.maximum(total_valid, 1.0)
+
+    per_example_valid = valid_mask.sum(axis=1)
+    per_example_has_valid = per_example_valid > 0
+    per_example_all_correct = jnp.all(
+        jnp.logical_or(~valid_mask, preds == shift_targets), axis=1
+    )
+    exact_correct = (
+        jnp.logical_and(per_example_has_valid, per_example_all_correct)
+        .sum()
+        .astype(jnp.float32)
+    )
+    exact_total = per_example_has_valid.sum().astype(jnp.float32)
+    puzzle_accuracy = exact_correct / jnp.maximum(exact_total, 1.0)
+
     shift_input_ids = input_ids[:, :-1].astype(jnp.int32)
     is_output_phase = jnp.cumsum(shift_input_ids == IO_SEPARATOR_TOKEN_ID, axis=1) >= 1
-    is_input_phase = jnp.logical_not(is_output_phase)
-
-    valid_input = valid_mask & is_input_phase
+    valid_input = valid_mask & ~is_output_phase
     valid_output = valid_mask & is_output_phase
 
-    num_output_tokens = valid_output.sum().astype(jnp.int32)
     input_denom = jnp.maximum(valid_input.sum().astype(jnp.float32), 1.0)
     output_denom = jnp.maximum(valid_output.sum().astype(jnp.float32), 1.0)
 
     input_loss = (raw_losses * valid_input.astype(jnp.float32)).sum() / input_denom
     output_loss = (raw_losses * valid_output.astype(jnp.float32)).sum() / output_denom
 
-    return ModelOutput(
-        logits=logits,
-        loss=loss,
-        input_loss=input_loss,
-        output_loss=output_loss,
-        num_output_tokens=num_output_tokens,
-    )
+    metrics = {
+        "loss": loss,
+        "input_loss": input_loss,
+        "output_loss": output_loss,
+        "percent_correct_tokens": token_accuracy,
+        "percent_correct_puzzles": puzzle_accuracy,
+    }
+    return logits, metrics

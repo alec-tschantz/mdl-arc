@@ -1,24 +1,21 @@
-# train_jax.py
-from __future__ import annotations
-
 import random
 import time
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, TypedDict
+
 import numpy as np
 import torch
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 import optax
-import wandb
 import tyro
+import wandb
+from jaxtyping import Array, Bool, Int
 
-from mdl.dataset import _maybe_apply_color_aug_in_loop, build_torch_data
-
+from mdl.dataset import augment_color, build_torch_data
 from mdl.model import Model, ModelConfig, compute_loss
 
 
@@ -49,6 +46,13 @@ class TrainConfig:
     name: Optional[str] = "baseline"
 
 
+class Batch(TypedDict):
+    input_ids: Int[Array, "B S"]
+    attention_mask: Bool[Array, "B S"]
+    example_ids: Int[Array, "B"]
+    positions_3d: Int[Array, "B S 3"]
+
+
 def set_seed(seed: int) -> jax.Array:
     random.seed(seed)
     np.random.seed(seed)
@@ -58,7 +62,7 @@ def set_seed(seed: int) -> jax.Array:
     return jax.random.PRNGKey(seed)
 
 
-def torch_batch_to_jax(batch: Dict[str, Any]) -> Dict[str, Any]:
+def torch_batch_to_jax(batch: Dict[str, Any]) -> Batch:
     input_ids = jnp.asarray(batch["input_ids"].cpu().numpy(), dtype=jnp.int32)
     attention_mask = jnp.asarray(batch["attention_mask"].cpu().numpy(), dtype=jnp.bool_)
     example_ids = jnp.asarray(batch["example_ids"].cpu().numpy(), dtype=jnp.int32)
@@ -72,21 +76,20 @@ def torch_batch_to_jax(batch: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _path_attr_names(path) -> Tuple[str, ...]:
-    names = []
-    for k in path:
-        if hasattr(k, "name"):
-            names.append(str(k.name))
-        elif hasattr(k, "key"):
-            names.append(str(k.key))
-        elif hasattr(k, "idx"):
-            names.append(str(k.idx))
-        else:
-            names.append(str(k))
-    return tuple(names)
-
-
 def make_weight_decay_mask(model: eqx.Module) -> Any:
+    def _path_attr_names(path) -> Tuple[str, ...]:
+        names = []
+        for k in path:
+            if hasattr(k, "name"):
+                names.append(str(k.name))
+            elif hasattr(k, "key"):
+                names.append(str(k.key))
+            elif hasattr(k, "idx"):
+                names.append(str(k.idx))
+            else:
+                names.append(str(k))
+        return tuple(names)
+
     params = eqx.filter(model, eqx.is_inexact_array)
     flat, treedef = jax.tree_util.tree_flatten_with_path(params)
 
@@ -121,32 +124,26 @@ def make_train_step(optimizer: optax.GradientTransformation):
     def train_step(
         model: eqx.Module,
         opt_state: optax.OptState,
-        batch: Dict[str, jax.Array],
+        batch: Batch,
         key: jax.Array,
     ):
         key, drop_key = jax.random.split(key)
 
         def loss_fn(m):
-            out = compute_loss(
+            _, metrics = compute_loss(
                 m,
                 batch,
                 key=drop_key,
                 inference=False,
             )
-            return out.loss, out
+            return metrics["loss"], metrics
 
-        (loss, out), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model)
+        (_, metrics), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model)
 
         params = eqx.filter(model, eqx.is_inexact_array)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         model = eqx.apply_updates(model, updates)
 
-        metrics = {
-            "loss": loss,
-            "input_loss": out.input_loss,
-            "output_loss": out.output_loss,
-            "num_output_tokens": out.num_output_tokens,
-        }
         return model, opt_state, metrics, key
 
     return train_step
@@ -154,23 +151,17 @@ def make_train_step(optimizer: optax.GradientTransformation):
 
 def make_val_step():
     @eqx.filter_jit
-    def val_step(model: eqx.Module, batch: Dict[str, jax.Array]):
-        out = compute_loss(model, batch, key=None, inference=True)
-        return out.output_loss, out.num_output_tokens
+    def val_step(model: eqx.Module, batch: Batch) -> Dict[str, jax.Array]:
+        _, metrics = compute_loss(model, batch, key=None, inference=True)
+        return metrics
 
     return val_step
 
 
 def main(cfg: TrainConfig) -> None:
-    print(f"JAX backend={jax.default_backend()} devices={jax.devices()}")
-    if not any(d.platform == "gpu" for d in jax.devices()):
-        print(
-            "WARNING: JAX is not running on GPU; expect very slow training. "
-            "Check your CUDA-enabled jax/jaxlib install."
-        )
     key = set_seed(cfg.seed)
 
-    train_dataset, train_loader, val_loader, data_path, color_augmentor = (
+    train_dataset, train_loader, val_loader, _data_path, color_augmentor = (
         build_torch_data(cfg)
     )
 
@@ -204,7 +195,9 @@ def main(cfg: TrainConfig) -> None:
         decay_progress = (step_m1 - warmup_f) / jnp.maximum(total_f - warmup_f, 1.0)
         decay_factor = 0.5 * (1.0 + jnp.cos(jnp.pi * decay_progress))
 
-        base_factor = jnp.where(warm_region, warm_factor, jnp.maximum(0.0, decay_factor))
+        base_factor = jnp.where(
+            warm_region, warm_factor, jnp.maximum(0.0, decay_factor)
+        )
         factor = jnp.where(step_f <= 0.0, 1.0, base_factor)
         return lr_base * factor
 
@@ -237,101 +230,88 @@ def main(cfg: TrainConfig) -> None:
 
     global_step = 0
     log_every = int(getattr(cfg, "log_every", 10))
-    metric_sums = {
-        "loss": jnp.array(0.0, dtype=jnp.float32),
-        "input_loss": jnp.array(0.0, dtype=jnp.float32),
-        "output_loss": jnp.array(0.0, dtype=jnp.float32),
-        "num_output_tokens": jnp.array(0, dtype=jnp.int32),
-    }
+    metric_sums: Optional[Dict[str, jax.Array]] = None
     train_step_time_sum = 0.0
     metric_steps = 0
+    metric_sums = None
+    val_sums = None
 
     for epoch in range(int(cfg.epochs)):
         if color_augmentor is not None and color_augmentor.num_permutations > 0:
             color_augmentor.set_index(epoch)
-            print(
-                f"Epoch {epoch+1}/{cfg.epochs} | "
-                f"Using color permutation {color_augmentor.current_index + 1}/{color_augmentor.num_permutations}"
-            )
-        else:
-            print(f"Epoch {epoch+1}/{cfg.epochs}")
 
         for batch in train_loader:
-            _maybe_apply_color_aug_in_loop(
-                batch,
-                color_augmentor=getattr(train_loader, "color_augmentor", None),
-                color_aug_in_collate=bool(
-                    getattr(train_loader, "color_aug_in_collate", False)
-                ),
-            )
+            color_aug = getattr(train_loader, "color_augmentor", None)
+            if color_aug is not None and not getattr(
+                train_loader, "color_aug_in_collate", False
+            ):
+                if color_aug.num_permutations > 0:
+                    augment_color(batch, color_augmentor=color_aug)
             jbatch = torch_batch_to_jax(batch)
 
             t_step_start = time.perf_counter()
             model, opt_state, metrics, key = train_step(model, opt_state, jbatch, key)
-            jax.block_until_ready(metrics["loss"])
+            jax.block_until_ready(metrics)
             t_step_end = time.perf_counter()
             global_step += 1
-            metric_sums = {
-                k: metric_sums[k] + metrics[k] for k in metric_sums
-            }
+
+            metric_sums = (
+                jax.tree.map(lambda a, b: a + b, metric_sums, metrics)
+                if metric_sums is not None
+                else metrics
+            )
             metric_steps += 1
             train_step_time_sum += t_step_end - t_step_start
 
             if log_every > 0 and global_step % log_every == 0:
-                sums = jax.device_get(metric_sums)
                 denom = float(max(metric_steps, 1))
+                mean_metrics = jax.tree.map(lambda x: x / denom, metric_sums)
+                mean_metrics = jax.device_get(mean_metrics)
                 lr_now = float(jax.device_get(lr_schedule(global_step)))
 
-                wandb.log(
+                log_payload = {f"train/{k}": float(v) for k, v in mean_metrics.items()}
+                log_payload.update(
                     {
-                        "train/loss": float(sums["loss"]) / denom,
-                        "train/input_loss": float(sums["input_loss"]) / denom,
-                        "train/output_loss": float(sums["output_loss"]) / denom,
-                        "train/num_output_tokens": int(sums["num_output_tokens"]) / denom,
                         "time/train_step_ms": (train_step_time_sum / denom) * 1e3,
                         "lr": lr_now,
                         "epoch": epoch + 1,
-                    },
-                    step=global_step,
+                    }
                 )
-                metric_sums = {
-                    "loss": jnp.array(0.0, dtype=jnp.float32),
-                    "input_loss": jnp.array(0.0, dtype=jnp.float32),
-                    "output_loss": jnp.array(0.0, dtype=jnp.float32),
-                    "num_output_tokens": jnp.array(0, dtype=jnp.int32),
-                }
+                wandb.log(log_payload, step=global_step)
+
+                metric_sums = None
                 train_step_time_sum = 0.0
                 metric_steps = 0
 
         if val_loader is not None:
-            total_loss_sum = 0.0
-            total_tokens = 0
+            val_sums: Optional[Dict[str, jax.Array]] = None
+            val_steps = 0
 
             for batch in val_loader:
                 if not any(batch.get("has_output", [True])):
                     continue
 
                 jbatch = torch_batch_to_jax(batch)
-                out_loss, num_out = val_step(model, jbatch)
-                out_loss = float(jax.device_get(out_loss))
-                num_out = int(jax.device_get(num_out))
-                total_loss_sum += out_loss * max(0, num_out)
-                total_tokens += max(0, num_out)
+                metrics = val_step(model, jbatch)
+                val_sums = (
+                    jax.tree.map(lambda a, b: a + b, val_sums, metrics)
+                    if val_sums is not None
+                    else metrics
+                )
+                val_steps += 1
 
-            val_output_loss = (
-                (total_loss_sum / total_tokens) if total_tokens > 0 else 0.0
-            )
-            print(
-                f"Epoch {epoch+1} | val/output_loss={val_output_loss:.6f} (tokens={total_tokens})"
-            )
-            wandb.log(
-                {
-                    "val/output_loss": float(val_output_loss),
-                    "val/output_tokens": int(total_tokens),
-                    "epoch": epoch + 1,
-                },
-                step=global_step,
-            )
+            if val_sums is not None:
+                denom = float(max(val_steps, 1))
+                mean_metrics = jax.tree.map(lambda x: x / denom, val_sums)
+                mean_metrics = jax.device_get(mean_metrics)
+                metrics_str = " | ".join(
+                    f"{k}={float(v):.6f}" for k, v in sorted(mean_metrics.items())
+                )
+                print(f"Epoch {epoch+1} | {metrics_str}")
+
+                log_payload = {f"val/{k}": float(v) for k, v in mean_metrics.items()}
+                log_payload["epoch"] = epoch + 1
+                wandb.log(log_payload, step=global_step)
 
     wandb.finish()
 
