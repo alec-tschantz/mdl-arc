@@ -510,7 +510,7 @@ def collate_examples(
         raise ValueError("Empty batch encountered during collation.")
 
     batch_size = len(batch)
-    max_len = max(example.seq_len for example in batch)
+    max_len = MAX_SEQ_LEN
 
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
