@@ -165,7 +165,7 @@ class Dataset:
 
         _process_dir(self.path / split)
         if self.subset == "train" and extra_train_path is not None:
-            _process_dir(Path(extra_train_path))
+            _process_dir(Path(extra_train_path) / split)
 
         self.tokens = np.stack(tokens_list).astype(np.int32)
         self.task_ids = np.array(task_id_list, dtype=np.int32)
