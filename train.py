@@ -23,7 +23,7 @@ MODEL_REGISTRY = {"mdl": mdl, "varc": varc}
 class Config:
     data_path: str = "data/arc"
     rearc_path: Optional[str] = "data/rearc"
-    epochs: int = 100
+    epochs: int = 1000
     batch_size: int = 256
     learning_rate: float = 3e-4
     weight_decay: float = 0.0

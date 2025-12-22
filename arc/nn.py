@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import equinox as eqx
 import jax
@@ -382,6 +382,54 @@ class SelfAttention(eqx.Module):
         attn_out = self.proj_dropout(attn_out, key=k_proj, inference=inference)
         return attn_out.astype(self.dtype)
 
+    def incremental(
+        self,
+        x: Float[Array, "B 1 D"],
+        *,
+        positions: Int[Array, "B 1 3"],
+        cache: Tuple[Float[Array, "B T H D"], Float[Array, "B T H D"]],
+        cache_index: Int[Array, ""],
+        key: Optional[jax.Array],
+        inference: bool,
+    ) -> Tuple[Float[Array, "B 1 D"], Tuple[jax.Array, jax.Array]]:
+        if self.rope_skip != 0:
+            raise ValueError("incremental attention does not support rope_skip")
+
+        inference = inference or (key is None)
+        k_attn, k_proj = (None, None) if key is None else jax.random.split(key, 2)
+
+        x = x.astype(self.dtype)
+        qkv = self.qkv_proj(x)
+        qkv = qkv.reshape(x.shape[0], 1, 3, self.n_heads, self.head_dim)
+        q = qkv[:, :, 0, :, :]
+        k = qkv[:, :, 1, :, :]
+        v = qkv[:, :, 2, :, :]
+
+        q, k = self.rope(q, k, positions)
+        q = q.astype(self.dtype)
+        k = k.astype(self.dtype)
+        v = v.astype(self.dtype)
+
+        k_cache, v_cache = cache
+        cache_index = jnp.asarray(cache_index, dtype=jnp.int32)
+        k_cache = lax.dynamic_update_slice(k_cache, k, (0, cache_index, 0, 0))
+        v_cache = lax.dynamic_update_slice(v_cache, v, (0, cache_index, 0, 0))
+
+        attn_out = _flash_attention(
+            q,
+            k_cache,
+            v_cache,
+            attention_mask=None,
+            is_causal=self.is_causal,
+            key_len=cache_index + 1,
+            q_offset=cache_index,
+        )
+        attn_out = self.attn_dropout(attn_out, key=k_attn, inference=inference)
+        attn_out = attn_out.reshape(x.shape[0], 1, -1)
+        attn_out = self.out_proj(attn_out)
+        attn_out = self.proj_dropout(attn_out, key=k_proj, inference=inference)
+        return attn_out.astype(self.dtype), (k_cache, v_cache)
+
 
 class FeedForward(eqx.Module):
     fc1: Linear
@@ -484,6 +532,35 @@ class TransformerBlock(eqx.Module):
         x = x + f
         return x.astype(self.dtype)
 
+    def incremental(
+        self,
+        x: Float[Array, "B 1 D"],
+        *,
+        positions: Int[Array, "B 1 3"],
+        cache: Tuple[Float[Array, "B T H D"], Float[Array, "B T H D"]],
+        cache_index: Int[Array, ""],
+        key: Optional[jax.Array],
+        inference: bool,
+    ) -> Tuple[Float[Array, "B 1 D"], Tuple[jax.Array, jax.Array]]:
+        k_attn, k_ff = (None, None) if key is None else jax.random.split(key, 2)
+        inference = inference or (key is None)
+
+        h = self.ln1(x)
+        a, cache = self.attn.incremental(
+            h,
+            positions=positions,
+            cache=cache,
+            cache_index=cache_index,
+            key=k_attn,
+            inference=inference,
+        )
+        x = x + a
+
+        h2 = self.ln2(x)
+        f = self.ff(h2, key=k_ff, inference=inference)
+        x = x + f
+        return x.astype(self.dtype), cache
+
 
 class Transformer(eqx.Module):
     layers: tuple
@@ -561,6 +638,34 @@ class Transformer(eqx.Module):
             )
         return x
 
+    def incremental(
+        self,
+        x: Float[Array, "B 1 D"],
+        *,
+        positions: Int[Array, "B 1 3"],
+        caches: Tuple[Tuple[jax.Array, jax.Array], ...],
+        cache_index: Int[Array, ""],
+        key: Optional[jax.Array],
+        inference: bool,
+    ) -> Tuple[Float[Array, "B 1 D"], Tuple[Tuple[jax.Array, jax.Array], ...]]:
+        layer_keys = (
+            [None] * len(self.layers)
+            if key is None
+            else list(jax.random.split(key, len(self.layers)))
+        )
+        new_caches = []
+        for layer, layer_key, cache in zip(self.layers, layer_keys, caches):
+            x, cache = layer.incremental(
+                x,
+                positions=positions,
+                cache=cache,
+                cache_index=cache_index,
+                key=layer_key,
+                inference=inference,
+            )
+            new_caches.append(cache)
+        return x, tuple(new_caches)
+
 
 def _flash_attention(
     q: Float[Array, "B T H D"],
@@ -569,6 +674,8 @@ def _flash_attention(
     *,
     attention_mask: Optional[Bool[Array, "B T"]],
     is_causal: bool,
+    key_len: Optional[Int[Array, ""]] = None,
+    q_offset: Int[Array, ""] = 0,
 ) -> Float[Array, "B T H D"]:
     _, q_len, _, _ = q.shape
     s_len = k.shape[1]
@@ -589,6 +696,11 @@ def _flash_attention(
     base_mask = base_mask.at[:, :, q_len:, :].set(False)
     base_mask = base_mask.at[:, :, :, s_len:].set(False)
 
+    if key_len is not None:
+        key_len = jnp.asarray(key_len, dtype=jnp.int32)
+        key_keep = jnp.arange(padded_s_len) < key_len
+        base_mask = base_mask & key_keep[None, None, None, :]
+
     if attention_mask is not None:
         key_keep = attention_mask.astype(jnp.bool_)
         if pad_s:
@@ -596,7 +708,10 @@ def _flash_attention(
         base_mask = base_mask & key_keep[:, None, None, :]
 
     if is_causal:
-        causal = jnp.tril(jnp.ones((padded_q_len, padded_s_len), dtype=jnp.bool_))
+        q_offset = jnp.asarray(q_offset, dtype=jnp.int32)
+        q_positions = q_offset + jnp.arange(padded_q_len, dtype=jnp.int32)
+        k_positions = jnp.arange(padded_s_len, dtype=jnp.int32)
+        causal = k_positions[None, :] <= q_positions[:, None]
         base_mask = base_mask & causal[None, None, :, :]
 
     attn_out = jax.nn.dot_product_attention(
