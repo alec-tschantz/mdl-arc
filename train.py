@@ -11,19 +11,15 @@ import optax
 import tyro
 import wandb
 
-from arc.dataset import Dataset
-import arc.mdl as mdl
-import arc.varc as varc
-
-
-MODEL_REGISTRY = {"mdl": mdl, "varc": varc}
+from arc.dataset import Dataset, VOCAB_SIZE
+import arc.model as arc_model
 
 
 @dataclass
 class Config:
     data_path: str = "data/arc"
     rearc_path: Optional[str] = "data/rearc"
-    epochs: int = 1000
+    epochs: int = 100
     batch_size: int = 256
     learning_rate: float = 3e-4
     weight_decay: float = 0.0
@@ -32,14 +28,16 @@ class Config:
     n_layers: int = 10
     d_ff: int = 2048
     dropout: float = 0.1
-    num_task_tokens: int = 1
+    num_support: int = 4
+    grid_size: int = 32
+    patch_size: int = 4
+    pad_loss_weight: float = 0.0
     dtype: str = "bfloat16"
     seed: int = 0
     log_every: int = 10
     wandb_project: str = "arc-compare"
-    wandb_run_name: Optional[str] = None
+    wandb_run_name: Optional[str] = "patch"
     max_grad_norm: float = 1.0
-    model: str = "varc"
 
 
 def make_train_step(optimizer: optax.GradientTransformation, loss_fn):
@@ -69,6 +67,22 @@ def make_train_step(optimizer: optax.GradientTransformation, loss_fn):
 
     return train_step
 
+
+def build_model(cfg, *, key: jax.Array) -> arc_model.Model:
+    model_cfg = arc_model.ModelConfig(
+        vocab_size=VOCAB_SIZE,
+        grid_size=cfg.grid_size,
+        patch_size=cfg.patch_size,
+        num_support=cfg.num_support,
+        d_model=cfg.d_model,
+        n_heads=cfg.n_heads,
+        d_ff=cfg.d_ff,
+        n_layers=cfg.n_layers,
+        dropout=cfg.dropout,
+        pad_loss_weight=cfg.pad_loss_weight,
+        dtype=getattr(jnp, cfg.dtype),
+    )
+    return arc_model.Model(model_cfg, key=key)
 
 def make_eval_step(loss_fn):
     def eval_step(
@@ -100,16 +114,21 @@ def create_datasets(config: Config):
         subset="train",
         batch_size=config.batch_size,
         seed=config.seed,
+        num_support=config.num_support,
+        grid_size=config.grid_size,
+        patch_size=config.patch_size,
     )
 
     eval_dataset = Dataset(
         path=Path(config.data_path),
         split="training",
         subset="test",
-        task_lookup=train_dataset.task_lookup,
         batch_size=config.batch_size,
         seed=config.seed,
         shuffle=False,
+        num_support=config.num_support,
+        grid_size=config.grid_size,
+        patch_size=config.patch_size,
     )
 
     return train_dataset, eval_dataset
@@ -153,9 +172,8 @@ def main(config: Config) -> None:
 
     train_dataset, eval_dataset = create_datasets(config)
 
-    model_module = MODEL_REGISTRY[config.model]
-    model = model_module.build_model(config, num_tasks=train_dataset.num_tasks, key=model_key)
-    loss_fn = model_module.loss_fn
+    model = build_model(config, key=model_key)
+    loss_fn = arc_model.loss_fn
 
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,

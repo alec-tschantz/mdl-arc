@@ -96,24 +96,74 @@ class Embedding(eqx.Module):
         return jnp.take(self.weight, ids, axis=0)
 
 
-class RotaryEmbedding2D(eqx.Module):
+class PatchEmbed(eqx.Module):
+    conv: eqx.nn.Conv2d
+    grid: int = eqx.field(static=True)
+    embed_dim: int = eqx.field(static=True)
+    patch_size: int = eqx.field(static=True)
+    dtype: jnp.dtype = eqx.field(static=True)
+
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int,
+        embed_dim: int,
+        *,
+        key: jax.Array,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        self.grid = image_size // patch_size
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.dtype = dtype
+        param_dtype = jnp.float32
+        self.conv = eqx.nn.Conv2d(
+            in_channels=embed_dim,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            use_bias=True,
+            padding=0,
+            dtype=param_dtype,
+            key=key,
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = x.astype(self.conv.weight.dtype)
+        x = self.conv(x)
+        x = jnp.transpose(x, (1, 2, 0))
+        x = x.reshape(self.grid * self.grid, self.embed_dim)
+        return x.astype(self.dtype)
+
+
+class RotaryEmbedding4D(eqx.Module):
+    cos_io: Float[Array, "MI DIO"]
+    sin_io: Float[Array, "MI DIO"]
     cos_x: Float[Array, "MX DX"]
     sin_x: Float[Array, "MX DX"]
     cos_y: Float[Array, "MY DY"]
     sin_y: Float[Array, "MY DY"]
+    cos_example: Float[Array, "ME DE"]
+    sin_example: Float[Array, "ME DE"]
     head_dim: int = eqx.field(static=True)
     base: float = eqx.field(static=True)
+    d_io: int = eqx.field(static=True)
     d_x: int = eqx.field(static=True)
     d_y: int = eqx.field(static=True)
+    d_example: int = eqx.field(static=True)
+    max_io: int = eqx.field(static=True)
     max_x: int = eqx.field(static=True)
     max_y: int = eqx.field(static=True)
+    max_example: int = eqx.field(static=True)
 
     def __init__(
         self,
         head_dim: int,
         *,
+        max_io: int,
         max_x: int,
         max_y: int,
+        max_example: int,
         base: float = 10000.0,
     ):
         if head_dim % 2 != 0:
@@ -122,15 +172,26 @@ class RotaryEmbedding2D(eqx.Module):
         self.base = base
 
         n_pairs = head_dim // 2
-        px = n_pairs // 2
-        py = n_pairs - px
-        self.d_x = px * 2
-        self.d_y = py * 2
+        p_io = n_pairs // 4
+        p_x = n_pairs // 4
+        p_y = n_pairs // 4
+        p_example = n_pairs - p_io - p_x - p_y
+        self.d_io = p_io * 2
+        self.d_x = p_x * 2
+        self.d_y = p_y * 2
+        self.d_example = p_example * 2
+
+        self.max_io = max_io
         self.max_x = max_x
         self.max_y = max_y
+        self.max_example = max_example
 
+        self.cos_io, self.sin_io = self._build_cache(self.d_io, self.max_io)
         self.cos_x, self.sin_x = self._build_cache(self.d_x, self.max_x)
         self.cos_y, self.sin_y = self._build_cache(self.d_y, self.max_y)
+        self.cos_example, self.sin_example = self._build_cache(
+            self.d_example, self.max_example
+        )
 
     def _build_cache(self, dim: int, max_pos: int):
         if dim <= 0:
@@ -151,137 +212,39 @@ class RotaryEmbedding2D(eqx.Module):
         self,
         q: Float[Array, "B T H D"],
         k: Float[Array, "B T H D"],
-        pos_xyz: Int[Array, "B T 3"],
+        pos_ioxy: Int[Array, "B T 4"],
     ):
         if q.shape[-1] != self.head_dim:
             raise ValueError("q/k last dim must equal head_dim")
-        pos_x = jnp.clip(pos_xyz[..., 0], 0, self.max_x - 1)
-        pos_y = jnp.clip(pos_xyz[..., 1], 0, self.max_y - 1)
+        pos_io = jnp.clip(pos_ioxy[..., 0], 0, self.max_io - 1)
+        pos_x = jnp.clip(pos_ioxy[..., 1], 0, self.max_x - 1)
+        pos_y = jnp.clip(pos_ioxy[..., 2], 0, self.max_y - 1)
+        pos_example = jnp.clip(pos_ioxy[..., 3], 0, self.max_example - 1)
 
         parts_cos = []
         parts_sin = []
+        if self.d_io > 0:
+            parts_cos.append(self.cos_io[pos_io])
+            parts_sin.append(self.sin_io[pos_io])
         if self.d_x > 0:
             parts_cos.append(self.cos_x[pos_x])
             parts_sin.append(self.sin_x[pos_x])
         if self.d_y > 0:
             parts_cos.append(self.cos_y[pos_y])
             parts_sin.append(self.sin_y[pos_y])
+        if self.d_example > 0:
+            parts_cos.append(self.cos_example[pos_example])
+            parts_sin.append(self.sin_example[pos_example])
 
         cos = (
             jnp.concatenate(parts_cos, axis=-1)
             if parts_cos
-            else jnp.zeros(pos_x.shape + (0,), dtype=jnp.float32)
+            else jnp.zeros(pos_io.shape + (0,), dtype=jnp.float32)
         )
         sin = (
             jnp.concatenate(parts_sin, axis=-1)
             if parts_sin
-            else jnp.zeros(pos_x.shape + (0,), dtype=jnp.float32)
-        )
-
-        cos = lax.stop_gradient(cos).astype(jnp.float32)[:, :, None, :]
-        sin = lax.stop_gradient(sin).astype(jnp.float32)[:, :, None, :]
-
-        qf = q.astype(jnp.float32)
-        kf = k.astype(jnp.float32)
-        q_out = qf * cos + _rotate_half(qf) * sin
-        k_out = kf * cos + _rotate_half(kf) * sin
-        return q_out.astype(q.dtype), k_out.astype(k.dtype)
-
-
-class RotaryEmbedding3D(eqx.Module):
-    cos_x: Float[Array, "MX DX"]
-    sin_x: Float[Array, "MX DX"]
-    cos_y: Float[Array, "MY DY"]
-    sin_y: Float[Array, "MY DY"]
-    cos_z: Float[Array, "MZ DZ"]
-    sin_z: Float[Array, "MZ DZ"]
-    head_dim: int = eqx.field(static=True)
-    base: float = eqx.field(static=True)
-    d_x: int = eqx.field(static=True)
-    d_y: int = eqx.field(static=True)
-    d_z: int = eqx.field(static=True)
-    max_x: int = eqx.field(static=True)
-    max_y: int = eqx.field(static=True)
-    max_z: int = eqx.field(static=True)
-
-    def __init__(
-        self,
-        head_dim: int,
-        *,
-        max_x: int,
-        max_y: int,
-        max_z: int,
-        base: float = 10000.0,
-    ):
-        if head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for RoPE.")
-        self.head_dim = head_dim
-        self.base = base
-
-        n_pairs = head_dim // 2
-        px = n_pairs // 3
-        py = n_pairs // 3
-        pz = n_pairs - px - py
-        self.d_x = px * 2
-        self.d_y = py * 2
-        self.d_z = pz * 2
-
-        self.max_x = max_x
-        self.max_y = max_y
-        self.max_z = max_z
-
-        self.cos_x, self.sin_x = self._build_cache(self.d_x, self.max_x)
-        self.cos_y, self.sin_y = self._build_cache(self.d_y, self.max_y)
-        self.cos_z, self.sin_z = self._build_cache(self.d_z, self.max_z)
-
-    def _build_cache(self, dim: int, max_pos: int):
-        if dim <= 0:
-            return (
-                jnp.zeros((0, 0), dtype=jnp.float32),
-                jnp.zeros((0, 0), dtype=jnp.float32),
-            )
-        inv_freq = 1.0 / (self.base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-        pos = jnp.arange(max_pos, dtype=jnp.float32)
-        t = pos[:, None] * inv_freq[None, :]
-        cos = jnp.cos(t)
-        sin = jnp.sin(t)
-        cos = jnp.repeat(cos, 2, axis=-1)
-        sin = jnp.repeat(sin, 2, axis=-1)
-        return cos, sin
-
-    def __call__(
-        self,
-        q: Float[Array, "B T H D"],
-        k: Float[Array, "B T H D"],
-        pos_xyz: Int[Array, "B T 3"],
-    ):
-        if q.shape[-1] != self.head_dim:
-            raise ValueError("q/k last dim must equal head_dim")
-        pos_x = jnp.clip(pos_xyz[..., 0], 0, self.max_x - 1)
-        pos_y = jnp.clip(pos_xyz[..., 1], 0, self.max_y - 1)
-        pos_z = jnp.clip(pos_xyz[..., 2], 0, self.max_z - 1)
-
-        parts_cos = []
-        parts_sin = []
-        if self.d_x > 0:
-            parts_cos.append(self.cos_x[pos_x])
-            parts_sin.append(self.sin_x[pos_x])
-        if self.d_y > 0:
-            parts_cos.append(self.cos_y[pos_y])
-            parts_sin.append(self.sin_y[pos_y])
-        if self.d_z > 0:
-            parts_cos.append(self.cos_z[pos_z])
-            parts_sin.append(self.sin_z[pos_z])
-
-        cos = (
-            jnp.concatenate(parts_cos, axis=-1)
-            if parts_cos
-            else jnp.zeros(pos_x.shape + (0,), dtype=jnp.float32)
-        )
-        sin = (
-            jnp.concatenate(parts_sin, axis=-1)
-            if parts_sin
-            else jnp.zeros(pos_x.shape + (0,), dtype=jnp.float32)
+            else jnp.zeros(pos_io.shape + (0,), dtype=jnp.float32)
         )
 
         cos = lax.stop_gradient(cos).astype(jnp.float32)[:, :, None, :]
@@ -340,7 +303,7 @@ class SelfAttention(eqx.Module):
         x: Float[Array, "B T D"],
         *,
         attention_mask: Optional[Bool[Array, "B T"]],
-        positions: Int[Array, "B T 3"],
+        positions: Int[Array, "B T 4"],
         key: Optional[jax.Array],
         inference: bool,
     ) -> Float[Array, "B T D"]:
@@ -386,7 +349,7 @@ class SelfAttention(eqx.Module):
         self,
         x: Float[Array, "B 1 D"],
         *,
-        positions: Int[Array, "B 1 3"],
+        positions: Int[Array, "B 1 4"],
         cache: Tuple[Float[Array, "B T H D"], Float[Array, "B T H D"]],
         cache_index: Int[Array, ""],
         key: Optional[jax.Array],
@@ -510,7 +473,7 @@ class TransformerBlock(eqx.Module):
         x: Float[Array, "B T D"],
         *,
         attention_mask: Optional[Bool[Array, "B T"]],
-        positions: Int[Array, "B T 3"],
+        positions: Int[Array, "B T 4"],
         key: Optional[jax.Array],
         inference: bool,
     ) -> Float[Array, "B T D"]:
@@ -536,7 +499,7 @@ class TransformerBlock(eqx.Module):
         self,
         x: Float[Array, "B 1 D"],
         *,
-        positions: Int[Array, "B 1 3"],
+        positions: Int[Array, "B 1 4"],
         cache: Tuple[Float[Array, "B T H D"], Float[Array, "B T H D"]],
         cache_index: Int[Array, ""],
         key: Optional[jax.Array],
@@ -574,29 +537,25 @@ class Transformer(eqx.Module):
         dropout: float,
         *,
         rope_mode: str,
+        rope_max_io: int,
         rope_max_x: int,
         rope_max_y: int,
-        rope_max_z: int,
+        rope_max_example: int,
         is_causal: bool,
         rope_skip: int,
         dtype: jnp.dtype,
         key: jax.Array,
     ):
-        if rope_mode == "2d":
-            rope_factory = lambda: RotaryEmbedding2D(
-                head_dim=embed_dim // num_heads,
-                max_x=rope_max_x,
-                max_y=rope_max_y,
-            )
-        elif rope_mode == "3d":
-            rope_factory = lambda: RotaryEmbedding3D(
-                head_dim=embed_dim // num_heads,
-                max_x=rope_max_x,
-                max_y=rope_max_y,
-                max_z=rope_max_z,
-            )
-        else:
+        if rope_mode != "4d":
             raise ValueError(f"Unsupported rope_mode: {rope_mode}")
+
+        rope_factory = lambda: RotaryEmbedding4D(
+            head_dim=embed_dim // num_heads,
+            max_io=rope_max_io,
+            max_x=rope_max_x,
+            max_y=rope_max_y,
+            max_example=rope_max_example,
+        )
 
         keys = jax.random.split(key, depth)
         self.layers = tuple(
@@ -619,7 +578,7 @@ class Transformer(eqx.Module):
         x: Float[Array, "B T D"],
         *,
         attention_mask: Optional[Bool[Array, "B T"]],
-        positions: Int[Array, "B T 3"],
+        positions: Int[Array, "B T 4"],
         key: Optional[jax.Array],
         inference: bool,
     ) -> Float[Array, "B T D"]:
@@ -642,7 +601,7 @@ class Transformer(eqx.Module):
         self,
         x: Float[Array, "B 1 D"],
         *,
-        positions: Int[Array, "B 1 3"],
+        positions: Int[Array, "B 1 4"],
         caches: Tuple[Tuple[jax.Array, jax.Array], ...],
         cache_index: Int[Array, ""],
         key: Optional[jax.Array],
