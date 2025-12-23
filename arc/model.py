@@ -155,6 +155,25 @@ def _weighted_mean(values, weights):
     return (values * weights.astype(jnp.float32)).sum() / denom
 
 
+def _masked_accuracy(preds, targets, mask):
+    correct = (preds == targets) & mask
+    denom = jnp.maximum(mask.sum().astype(jnp.float32), 1.0)
+    return correct.sum().astype(jnp.float32) / denom
+
+
+def _masked_exact(preds, targets, mask):
+    per_example_valid = mask.sum(axis=(1, 2))
+    per_example_has_valid = per_example_valid > 0
+    per_example_all_correct = jnp.all(
+        jnp.logical_or(~mask, preds == targets), axis=(1, 2)
+    )
+    exact_correct = jnp.logical_and(
+        per_example_has_valid, per_example_all_correct
+    ).sum()
+    exact_total = per_example_has_valid.sum()
+    return exact_correct.astype(jnp.float32) / jnp.maximum(exact_total, 1.0)
+
+
 def loss_fn(
     model: Model,
     batch: Dict[str, jax.Array],
@@ -184,18 +203,27 @@ def loss_fn(
     total_weights = jnp.where(cell_mask, 1.0, model.pad_loss_weight)
     total_loss = _weighted_mean(nll, total_weights)
 
+    preds = jnp.argmax(shift_logits, axis=-1).astype(jnp.int32)
+    accuracy = _masked_accuracy(preds, shift_targets, cell_mask)
+
     tokens_per_grid = model.patch_embed.grid * model.patch_embed.grid
     query_grid_index = 2 * model.num_support + 1
     query_start = query_grid_index * tokens_per_grid
     query_end = query_start + tokens_per_grid
     token_idx = jnp.arange(shift_targets.shape[1]) + 1
     query_token_mask = (token_idx >= query_start) & (token_idx < query_end)
+    query_mask = cell_mask & query_token_mask[None, :, None]
     query_token_mask = query_token_mask.astype(jnp.float32)[None, :, None]
     query_weights = jnp.where(cell_mask, 1.0, model.pad_loss_weight) * query_token_mask
     query_loss = _weighted_mean(nll, query_weights)
+    query_accuracy = _masked_accuracy(preds, shift_targets, query_mask)
+    exact_accuracy = _masked_exact(preds, shift_targets, query_mask)
 
     metrics = {
         "loss": total_loss,
         "query_loss": query_loss,
+        "accuracy": accuracy,
+        "query_accuracy": query_accuracy,
+        "exact_accuracy": exact_accuracy,
     }
     return total_loss, metrics
