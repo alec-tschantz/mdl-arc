@@ -22,6 +22,7 @@ class ModelConfig:
     n_layers: int = 10
     dropout: float = 0.1
     pad_loss_weight: float = 0.0
+    loss_on_query_only: bool = False
     dtype: jnp.dtype = jnp.bfloat16
 
 
@@ -38,6 +39,7 @@ class Model(eqx.Module):
     patch_dim: int = eqx.field(static=True)
     vocab_size: int = eqx.field(static=True)
     pad_loss_weight: float = eqx.field(static=True)
+    loss_on_query_only: bool = eqx.field(static=True)
     dtype: jnp.dtype = eqx.field(static=True)
 
     def __init__(
@@ -55,6 +57,7 @@ class Model(eqx.Module):
         self.patch_dim = cfg.patch_size * cfg.patch_size
         self.vocab_size = cfg.vocab_size
         self.pad_loss_weight = cfg.pad_loss_weight
+        self.loss_on_query_only = cfg.loss_on_query_only
         self.dtype = cfg.dtype
 
         patch_grid = cfg.grid_size // cfg.patch_size
@@ -202,9 +205,6 @@ def loss_fn(
     nll = -jnp.take_along_axis(logp, safe_targets[..., None], axis=-1)[..., 0]
 
     cell_mask = shift_targets != data.IGNORE_TOKEN_ID
-    total_weights = jnp.where(cell_mask, 1.0, model.pad_loss_weight)
-    total_loss = _weighted_mean(nll, total_weights)
-
     preds = jnp.argmax(shift_logits, axis=-1).astype(jnp.int32)
     accuracy = _masked_accuracy(preds, shift_targets, cell_mask)
 
@@ -220,6 +220,12 @@ def loss_fn(
     query_loss = _weighted_mean(nll, query_weights)
     query_accuracy = _masked_accuracy(preds, shift_targets, query_mask)
     exact_accuracy = _masked_exact(preds, shift_targets, query_mask)
+
+    if model.loss_on_query_only:
+        total_loss = query_loss
+    else:
+        total_weights = jnp.where(cell_mask, 1.0, model.pad_loss_weight)
+        total_loss = _weighted_mean(nll, total_weights)
 
     metrics = {
         "loss": total_loss,
