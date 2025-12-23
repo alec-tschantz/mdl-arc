@@ -9,6 +9,8 @@ from jaxtyping import Array, Bool, Float, Int
 from . import dataset as data
 from .nn import PatchEmbed, LayerNorm, Linear, Transformer
 
+Metrics = Dict[str, Float[Array, ""]]
+
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -129,8 +131,6 @@ class Model(eqx.Module):
         logits = logits.reshape(x.shape[0], x.shape[1], self.patch_dim, self.vocab_size)
         return logits
 
-
-Metrics = Dict[str, Float[Array, ""]]
 
 
 def _patchify_grids(
