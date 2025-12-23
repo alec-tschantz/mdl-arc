@@ -11,38 +11,165 @@ import optax
 import tyro
 import wandb
 
+from arc import dataset as data
 from arc.dataset import Dataset
-import arc.mdl as mdl
-import arc.varc as varc
-
-
-MODEL_REGISTRY = {"mdl": mdl, "varc": varc}
+from arc import model as model_lib
 
 
 @dataclass
 class Config:
     data_path: str = "data/arc"
     rearc_path: Optional[str] = "data/rearc"
-    epochs: int = 1000
+    epochs: int = 100
     batch_size: int = 256
     learning_rate: float = 3e-4
-    weight_decay: float = 0.0
     d_model: int = 512
     n_heads: int = 8
     n_layers: int = 10
     d_ff: int = 2048
     dropout: float = 0.1
-    num_task_tokens: int = 1
     dtype: str = "bfloat16"
     seed: int = 0
     log_every: int = 10
     wandb_project: str = "arc-compare"
     wandb_run_name: Optional[str] = None
     max_grad_norm: float = 1.0
-    model: str = "varc"
+    refine_steps: int = 3
+    refine_update_in_loop: bool = True
 
 
-def make_train_step(optimizer: optax.GradientTransformation, loss_fn):
+def _init_metrics():
+    return {
+        "loss": jnp.array(0.0, dtype=jnp.float32),
+        "pixel_acc": jnp.array(0.0, dtype=jnp.float32),
+        "exact_acc": jnp.array(0.0, dtype=jnp.float32),
+    }
+
+
+def _flatten_grid(x: jax.Array) -> jax.Array:
+    return x.reshape(x.shape[0], -1)
+
+
+def _init_output_tokens(targets: jax.Array):
+    output_mask = targets != data.IGNORE_TOKEN_ID
+    output_tokens = jnp.where(output_mask, data.MASK_TOKEN_ID, data.IGNORE_TOKEN_ID)
+    return _flatten_grid(output_tokens), output_mask
+
+
+def _next_output_tokens(logits: jax.Array, output_mask: jax.Array) -> jax.Array:
+    output_logits = logits[:, data.GRID_LEN :, :]
+    preds = jnp.argmax(output_logits, axis=-1).astype(jnp.int32)
+    preds = jax.lax.stop_gradient(preds)
+    output_mask_flat = output_mask.reshape(preds.shape)
+    return jnp.where(output_mask_flat, preds, data.IGNORE_TOKEN_ID)
+
+
+def _loss_and_metrics(
+    logits: jax.Array,
+    targets: jax.Array,
+    output_mask: jax.Array,
+):
+    output_logits = logits[:, data.GRID_LEN :, :]
+    targets_flat = _flatten_grid(targets.astype(jnp.int32))
+    output_mask_flat = output_mask.reshape(targets_flat.shape)
+
+    logp = jax.nn.log_softmax(output_logits.astype(jnp.float32), axis=-1)
+    safe_targets = jnp.clip(targets_flat, 0, logp.shape[-1] - 1)
+    nll = -jnp.take_along_axis(logp, safe_targets[..., None], axis=-1)[..., 0]
+
+    mask_float = output_mask_flat.astype(jnp.float32)
+    denom = jnp.maximum(mask_float.sum(), 1.0)
+    loss = (nll * mask_float).sum() / denom
+
+    preds = jnp.argmax(output_logits, axis=-1).astype(jnp.int32)
+    correct = (preds == targets_flat) & output_mask_flat
+    pixel_acc = correct.sum().astype(jnp.float32) / denom
+
+    per_example_valid = output_mask_flat.sum(axis=1)
+    per_example_has_valid = per_example_valid > 0
+    per_example_all_correct = jnp.all(
+        jnp.logical_or(~output_mask_flat, preds == targets_flat), axis=1
+    )
+    exact_correct = jnp.sum(per_example_all_correct & per_example_has_valid)
+    exact_total = jnp.maximum(jnp.sum(per_example_has_valid), 1)
+    exact_acc = exact_correct.astype(jnp.float32) / exact_total.astype(jnp.float32)
+
+    metrics = {"loss": loss, "pixel_acc": pixel_acc, "exact_acc": exact_acc}
+    return loss, metrics
+
+
+def build_model(config: Config, *, num_tasks: int, key: jax.Array) -> model_lib.Model:
+    model_cfg = model_lib.ModelConfig(
+        d_model=config.d_model,
+        n_heads=config.n_heads,
+        d_ff=config.d_ff,
+        n_layers=config.n_layers,
+        dropout=config.dropout,
+        dtype=getattr(jnp, config.dtype),
+    )
+    return model_lib.Model(model_cfg, num_tasks=num_tasks, key=key)
+
+
+def make_train_step(
+    optimizer: optax.GradientTransformation,
+    refine_steps: int,
+    update_in_loop: bool,
+):
+    if update_in_loop:
+        def train_step(
+            params,
+            static,
+            opt_state: optax.OptState,
+            batch: Dict[str, jax.Array],
+            key: jax.Array,
+        ):
+            inputs = batch["inputs"]
+            inputs_flat = _flatten_grid(inputs)
+            targets = batch["targets"]
+            task_ids = batch["task_ids"]
+            attention_mask = batch["attention_mask"]
+            output_tokens, output_mask = _init_output_tokens(targets)
+            step_keys = jax.random.split(key, refine_steps)
+
+            def step_fn(carry, step_key):
+                params, opt_state, output_tokens, _ = carry
+
+                def loss_fn(p):
+                    model = eqx.combine(p, static)
+                    tokens = jnp.concatenate([inputs_flat, output_tokens], axis=1)
+                    logits = model(
+                        tokens,
+                        task_ids,
+                        attention_mask=attention_mask,
+                        key=step_key,
+                        inference=False,
+                    )
+                    loss, metrics = _loss_and_metrics(logits, targets, output_mask)
+                    return loss, (metrics, logits)
+
+                (loss, (metrics, logits)), grads = eqx.filter_value_and_grad(
+                    loss_fn, has_aux=True
+                )(params)
+                grads = jax.lax.pmean(grads, axis_name="devices")
+
+                updates, opt_state = optimizer.update(grads, opt_state, params=params)
+                params = eqx.apply_updates(params, updates)
+
+                output_tokens = _next_output_tokens(logits, output_mask)
+                return (params, opt_state, output_tokens, metrics), None
+
+            init_carry = (params, opt_state, output_tokens, _init_metrics())
+            (params, opt_state, _, metrics), _ = jax.lax.scan(
+                step_fn, init_carry, step_keys
+            )
+
+            metrics = jax.tree_util.tree_map(
+                lambda x: jax.lax.pmean(x, "devices"), metrics
+            )
+            return params, static, opt_state, metrics
+
+        return train_step
+
     def train_step(
         params,
         static,
@@ -50,18 +177,44 @@ def make_train_step(optimizer: optax.GradientTransformation, loss_fn):
         batch: Dict[str, jax.Array],
         key: jax.Array,
     ):
-        def compute_loss(p):
-            model = eqx.combine(p, static)
-            return loss_fn(model, batch, key=key, inference=False)
+        inputs = batch["inputs"]
+        inputs_flat = _flatten_grid(inputs)
+        targets = batch["targets"]
+        task_ids = batch["task_ids"]
+        attention_mask = batch["attention_mask"]
+        output_tokens, output_mask = _init_output_tokens(targets)
+        step_keys = jax.random.split(key, refine_steps)
 
-        (loss, metrics), grads = eqx.filter_value_and_grad(compute_loss, has_aux=True)(
+        def loss_fn(p):
+            model = eqx.combine(p, static)
+
+            def step_fn(carry, step_key):
+                output_tokens, loss_sum, metrics = carry
+                tokens = jnp.concatenate([inputs_flat, output_tokens], axis=1)
+                logits = model(
+                    tokens,
+                    task_ids,
+                    attention_mask=attention_mask,
+                    key=step_key,
+                    inference=False,
+                )
+                loss, metrics = _loss_and_metrics(logits, targets, output_mask)
+                output_tokens = _next_output_tokens(logits, output_mask)
+                loss_sum = loss_sum + loss
+                return (output_tokens, loss_sum, metrics), None
+
+            init_carry = (output_tokens, jnp.array(0.0, dtype=jnp.float32), _init_metrics())
+            (_, loss_sum, metrics), _ = jax.lax.scan(step_fn, init_carry, step_keys)
+            loss = loss_sum / refine_steps
+            metrics = dict(metrics)
+            metrics["loss"] = loss
+            return loss, metrics
+
+        (loss, metrics), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
             params
         )
         grads = jax.lax.pmean(grads, axis_name="devices")
-        _ = jax.lax.pmean(loss, axis_name="devices")
-        metrics = jax.tree_util.tree_map(
-            lambda x: jax.lax.pmean(x, "devices"), metrics
-        )
+        metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "devices"), metrics)
 
         updates, opt_state = optimizer.update(grads, opt_state, params=params)
         params = eqx.apply_updates(params, updates)
@@ -70,16 +223,39 @@ def make_train_step(optimizer: optax.GradientTransformation, loss_fn):
     return train_step
 
 
-def make_eval_step(loss_fn):
+def make_eval_step(refine_steps: int):
     def eval_step(
         params,
         static,
         batch: Dict[str, jax.Array],
         key: jax.Array,
     ):
-        _, metrics = loss_fn(
-            eqx.combine(params, static), batch, key=key, inference=True
-        )
+        inputs = batch["inputs"]
+        inputs_flat = _flatten_grid(inputs)
+        targets = batch["targets"]
+        task_ids = batch["task_ids"]
+        attention_mask = batch["attention_mask"]
+        output_tokens, output_mask = _init_output_tokens(targets)
+        step_keys = jax.random.split(key, refine_steps)
+
+        model = eqx.combine(params, static)
+
+        def step_fn(carry, step_key):
+            output_tokens, metrics = carry
+            tokens = jnp.concatenate([inputs_flat, output_tokens], axis=1)
+            logits = model(
+                tokens,
+                task_ids,
+                attention_mask=attention_mask,
+                key=step_key,
+                inference=True,
+            )
+            _, metrics = _loss_and_metrics(logits, targets, output_mask)
+            output_tokens = _next_output_tokens(logits, output_mask)
+            return (output_tokens, metrics), None
+
+        init_carry = (output_tokens, _init_metrics())
+        (_, metrics), _ = jax.lax.scan(step_fn, init_carry, step_keys)
         return jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "devices"), metrics)
 
     return eval_step
@@ -147,15 +323,14 @@ def main(config: Config) -> None:
     devices = jax.local_devices()
     num_devices = len(devices)
     assert config.batch_size % num_devices == 0
+    assert config.refine_steps >= 1
 
     key = jax.random.PRNGKey(config.seed)
     model_key, train_key, eval_key = jax.random.split(key, 3)
 
     train_dataset, eval_dataset = create_datasets(config)
 
-    model_module = MODEL_REGISTRY[config.model]
-    model = model_module.build_model(config, num_tasks=train_dataset.num_tasks, key=model_key)
-    loss_fn = model_module.loss_fn
+    model = build_model(config, num_tasks=train_dataset.num_tasks, key=model_key)
 
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
@@ -165,10 +340,10 @@ def main(config: Config) -> None:
         end_value=0.0,
     )
 
-    params, static = eqx.partition(model, eqx.is_array)
+    params, static = eqx.partition(model, eqx.is_inexact_array)
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
-        optax.adamw(learning_rate=lr_schedule, weight_decay=config.weight_decay),
+        optax.adam(learning_rate=lr_schedule),
     )
     opt_state = optimizer.init(params)
 
@@ -176,10 +351,14 @@ def main(config: Config) -> None:
     static = jax.device_put_replicated(static, devices)
     opt_state = jax.device_put_replicated(opt_state, devices)
 
-    train_step = make_train_step(optimizer, loss_fn)
+    train_step = make_train_step(
+        optimizer,
+        refine_steps=config.refine_steps,
+        update_in_loop=config.refine_update_in_loop,
+    )
     p_train_step = jax.pmap(train_step, axis_name="devices")
 
-    eval_step = make_eval_step(loss_fn)
+    eval_step = make_eval_step(refine_steps=config.refine_steps)
     p_eval_step = jax.pmap(eval_step, axis_name="devices")
 
     wandb.init(

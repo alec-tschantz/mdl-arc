@@ -2,4 +2,3 @@
 wandb/
 checkpoints/
 __pycache__/
-mdlARC/

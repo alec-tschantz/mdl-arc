@@ -1,6 +1,5 @@
 from . import dataset
-from . import mdl
+from . import model
 from . import nn
-from . import varc
 
-__all__ = ["dataset", "mdl", "nn", "varc"]
+__all__ = ["dataset", "model", "nn"]
