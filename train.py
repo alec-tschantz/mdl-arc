@@ -34,8 +34,6 @@ class Config:
     wandb_project: str = "arc-compare"
     wandb_run_name: Optional[str] = None
     max_grad_norm: float = 1.0
-    refine_steps: int = 3
-    refine_update_in_loop: bool = True
 
 
 def _init_metrics():
@@ -112,64 +110,7 @@ def build_model(config: Config, *, num_tasks: int, key: jax.Array) -> model_lib.
 
 def make_train_step(
     optimizer: optax.GradientTransformation,
-    refine_steps: int,
-    update_in_loop: bool,
 ):
-    if update_in_loop:
-        def train_step(
-            params,
-            static,
-            opt_state: optax.OptState,
-            batch: Dict[str, jax.Array],
-            key: jax.Array,
-        ):
-            inputs = batch["inputs"]
-            inputs_flat = _flatten_grid(inputs)
-            targets = batch["targets"]
-            task_ids = batch["task_ids"]
-            attention_mask = batch["attention_mask"]
-            output_tokens, output_mask = _init_output_tokens(targets)
-            step_keys = jax.random.split(key, refine_steps)
-
-            def step_fn(carry, step_key):
-                params, opt_state, output_tokens, _ = carry
-
-                def loss_fn(p):
-                    model = eqx.combine(p, static)
-                    tokens = jnp.concatenate([inputs_flat, output_tokens], axis=1)
-                    logits = model(
-                        tokens,
-                        task_ids,
-                        attention_mask=attention_mask,
-                        key=step_key,
-                        inference=False,
-                    )
-                    loss, metrics = _loss_and_metrics(logits, targets, output_mask)
-                    return loss, (metrics, logits)
-
-                (loss, (metrics, logits)), grads = eqx.filter_value_and_grad(
-                    loss_fn, has_aux=True
-                )(params)
-                grads = jax.lax.pmean(grads, axis_name="devices")
-
-                updates, opt_state = optimizer.update(grads, opt_state, params=params)
-                params = eqx.apply_updates(params, updates)
-
-                output_tokens = _next_output_tokens(logits, output_mask)
-                return (params, opt_state, output_tokens, metrics), None
-
-            init_carry = (params, opt_state, output_tokens, _init_metrics())
-            (params, opt_state, _, metrics), _ = jax.lax.scan(
-                step_fn, init_carry, step_keys
-            )
-
-            metrics = jax.tree_util.tree_map(
-                lambda x: jax.lax.pmean(x, "devices"), metrics
-            )
-            return params, static, opt_state, metrics
-
-        return train_step
-
     def train_step(
         params,
         static,
@@ -183,31 +124,18 @@ def make_train_step(
         task_ids = batch["task_ids"]
         attention_mask = batch["attention_mask"]
         output_tokens, output_mask = _init_output_tokens(targets)
-        step_keys = jax.random.split(key, refine_steps)
 
         def loss_fn(p):
             model = eqx.combine(p, static)
-
-            def step_fn(carry, step_key):
-                output_tokens, loss_sum, metrics = carry
-                tokens = jnp.concatenate([inputs_flat, output_tokens], axis=1)
-                logits = model(
-                    tokens,
-                    task_ids,
-                    attention_mask=attention_mask,
-                    key=step_key,
-                    inference=False,
-                )
-                loss, metrics = _loss_and_metrics(logits, targets, output_mask)
-                output_tokens = _next_output_tokens(logits, output_mask)
-                loss_sum = loss_sum + loss
-                return (output_tokens, loss_sum, metrics), None
-
-            init_carry = (output_tokens, jnp.array(0.0, dtype=jnp.float32), _init_metrics())
-            (_, loss_sum, metrics), _ = jax.lax.scan(step_fn, init_carry, step_keys)
-            loss = loss_sum / refine_steps
-            metrics = dict(metrics)
-            metrics["loss"] = loss
+            tokens = jnp.concatenate([inputs_flat, output_tokens], axis=1)
+            logits = model(
+                tokens,
+                task_ids,
+                attention_mask=attention_mask,
+                key=key,
+                inference=False,
+            )
+            loss, metrics = _loss_and_metrics(logits, targets, output_mask)
             return loss, metrics
 
         (loss, metrics), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
@@ -223,7 +151,7 @@ def make_train_step(
     return train_step
 
 
-def make_eval_step(refine_steps: int):
+def make_eval_step():
     def eval_step(
         params,
         static,
@@ -236,26 +164,18 @@ def make_eval_step(refine_steps: int):
         task_ids = batch["task_ids"]
         attention_mask = batch["attention_mask"]
         output_tokens, output_mask = _init_output_tokens(targets)
-        step_keys = jax.random.split(key, refine_steps)
 
         model = eqx.combine(params, static)
 
-        def step_fn(carry, step_key):
-            output_tokens, metrics = carry
-            tokens = jnp.concatenate([inputs_flat, output_tokens], axis=1)
-            logits = model(
-                tokens,
-                task_ids,
-                attention_mask=attention_mask,
-                key=step_key,
-                inference=True,
-            )
-            _, metrics = _loss_and_metrics(logits, targets, output_mask)
-            output_tokens = _next_output_tokens(logits, output_mask)
-            return (output_tokens, metrics), None
-
-        init_carry = (output_tokens, _init_metrics())
-        (_, metrics), _ = jax.lax.scan(step_fn, init_carry, step_keys)
+        tokens = jnp.concatenate([inputs_flat, output_tokens], axis=1)
+        logits = model(
+            tokens,
+            task_ids,
+            attention_mask=attention_mask,
+            key=key,
+            inference=True,
+        )
+        _, metrics = _loss_and_metrics(logits, targets, output_mask)
         return jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "devices"), metrics)
 
     return eval_step
@@ -323,7 +243,6 @@ def main(config: Config) -> None:
     devices = jax.local_devices()
     num_devices = len(devices)
     assert config.batch_size % num_devices == 0
-    assert config.refine_steps >= 1
 
     key = jax.random.PRNGKey(config.seed)
     model_key, train_key, eval_key = jax.random.split(key, 3)
@@ -353,12 +272,10 @@ def main(config: Config) -> None:
 
     train_step = make_train_step(
         optimizer,
-        refine_steps=config.refine_steps,
-        update_in_loop=config.refine_update_in_loop,
     )
     p_train_step = jax.pmap(train_step, axis_name="devices")
 
-    eval_step = make_eval_step(refine_steps=config.refine_steps)
+    eval_step = make_eval_step()
     p_eval_step = jax.pmap(eval_step, axis_name="devices")
 
     wandb.init(
