@@ -140,7 +140,7 @@ class PatchEmbed(eqx.Module):
 
 
 class LocalMixer(eqx.Module):
-    weight: Float[Array, "K K C 1"]
+    weight: Float[Array, "K K 1 C"]
     bias: Optional[Float[Array, "C"]]
     kernel_size: int = eqx.field(static=True)
     dtype: jnp.dtype = eqx.field(static=True)
@@ -160,7 +160,7 @@ class LocalMixer(eqx.Module):
         scale = 0.02
         self.weight = scale * jax.random.normal(
             k_w,
-            (kernel_size, kernel_size, channels, 1),
+            (kernel_size, kernel_size, 1, channels),
             dtype=jnp.float32,
         )
         if bias:
