@@ -139,6 +139,58 @@ class PatchEmbed(eqx.Module):
         return x.astype(self.dtype)
 
 
+class LocalMixer(eqx.Module):
+    weight: Float[Array, "K K C 1"]
+    bias: Optional[Float[Array, "C"]]
+    kernel_size: int = eqx.field(static=True)
+    dtype: jnp.dtype = eqx.field(static=True)
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        kernel_size: int = 3,
+        key: jax.Array,
+        dtype: jnp.dtype = jnp.bfloat16,
+        bias: bool = True,
+    ):
+        self.kernel_size = kernel_size
+        self.dtype = dtype
+        k_w, k_b = jax.random.split(key)
+        scale = 0.02
+        self.weight = scale * jax.random.normal(
+            k_w,
+            (kernel_size, kernel_size, channels, 1),
+            dtype=jnp.float32,
+        )
+        if bias:
+            self.bias = jnp.zeros((channels,), dtype=jnp.float32)
+        else:
+            self.bias = None
+
+    def __call__(
+        self, x: Float[Array, "N H W C"], *, mask: Optional[Bool[Array, "N H W"]]
+    ) -> Float[Array, "N H W C"]:
+        x_dtype = x.dtype
+        xf = x.astype(jnp.float32)
+        if mask is not None:
+            mask_f = mask.astype(xf.dtype)
+            xf = xf * mask_f[..., None]
+        y = lax.conv_general_dilated(
+            xf,
+            self.weight,
+            window_strides=(1, 1),
+            padding="SAME",
+            dimension_numbers=("NHWC", "HWIO", "NHWC"),
+            feature_group_count=xf.shape[-1],
+        )
+        if self.bias is not None:
+            y = y + self.bias
+        if mask is not None:
+            y = y * mask_f[..., None]
+        return y.astype(x_dtype)
+
+
 class RotaryEmbedding4D(eqx.Module):
     cos_io: Float[Array, "MI DIO"]
     sin_io: Float[Array, "MI DIO"]

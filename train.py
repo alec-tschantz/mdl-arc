@@ -33,6 +33,7 @@ class Config:
     patch_size: int = 2
     pad_loss_weight: float = 0.0
     loss_on_query_only: bool = False
+    local_mixer_kernel: int = 3
     dtype: str = "bfloat16"
     seed: int = 0
     log_every: int = 10
@@ -82,6 +83,7 @@ def build_model(cfg, *, key: jax.Array) -> arc_model.Model:
         dropout=cfg.dropout,
         pad_loss_weight=cfg.pad_loss_weight,
         loss_on_query_only=cfg.loss_on_query_only,
+        local_mixer_kernel=cfg.local_mixer_kernel,
         dtype=getattr(jnp, cfg.dtype),
     )
     return arc_model.Model(model_cfg, key=key)

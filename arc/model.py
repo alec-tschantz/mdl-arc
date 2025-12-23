@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
 from . import dataset as data
-from .nn import PatchEmbed, LayerNorm, Linear, Transformer
+from .nn import PatchEmbed, LayerNorm, Linear, LocalMixer, Transformer
 
 Metrics = Dict[str, Float[Array, ""]]
 
@@ -25,6 +25,7 @@ class ModelConfig:
     dropout: float = 0.1
     pad_loss_weight: float = 0.0
     loss_on_query_only: bool = False
+    local_mixer_kernel: int = 3
     dtype: jnp.dtype = jnp.bfloat16
 
 
@@ -34,6 +35,7 @@ class Model(eqx.Module):
     blocks: Transformer
     norm: LayerNorm
     head: Linear
+    local_mixer: Optional[LocalMixer]
 
     grid_size: int = eqx.field(static=True)
     patch_size: int = eqx.field(static=True)
@@ -42,6 +44,7 @@ class Model(eqx.Module):
     vocab_size: int = eqx.field(static=True)
     pad_loss_weight: float = eqx.field(static=True)
     loss_on_query_only: bool = eqx.field(static=True)
+    local_mixer_kernel: int = eqx.field(static=True)
     dtype: jnp.dtype = eqx.field(static=True)
 
     def __init__(
@@ -60,11 +63,12 @@ class Model(eqx.Module):
         self.vocab_size = cfg.vocab_size
         self.pad_loss_weight = cfg.pad_loss_weight
         self.loss_on_query_only = cfg.loss_on_query_only
+        self.local_mixer_kernel = cfg.local_mixer_kernel
         self.dtype = cfg.dtype
 
         patch_grid = cfg.grid_size // cfg.patch_size
 
-        k_patch, k_blocks, k_head = jax.random.split(key, 3)
+        k_patch, k_mixer, k_blocks, k_head = jax.random.split(key, 4)
         self.patch_embed = PatchEmbed(
             cfg.grid_size,
             cfg.patch_size,
@@ -94,15 +98,48 @@ class Model(eqx.Module):
         self.head = Linear(
             cfg.d_model, cfg.vocab_size * self.patch_dim, key=k_head, dtype=cfg.dtype
         )
+        self.local_mixer = (
+            LocalMixer(
+                cfg.d_model,
+                kernel_size=cfg.local_mixer_kernel,
+                key=k_mixer,
+                dtype=cfg.dtype,
+            )
+            if cfg.local_mixer_kernel > 0
+            else None
+        )
 
     def _embed_grids(self, grids: Int[Array, "B G H W"]) -> Float[Array, "B T D"]:
         bsz, num_grids, height, width = grids.shape
         flat = grids.reshape(bsz * num_grids, height, width)
         one_hot = jax.nn.one_hot(flat.astype(jnp.int32), self.vocab_size)
+        if data.IGNORE_TOKEN_ID < self.vocab_size:
+            one_hot = one_hot.at[..., data.IGNORE_TOKEN_ID].set(0)
         one_hot = jnp.transpose(one_hot, (0, 3, 1, 2))
         patch_tokens = jax.vmap(self.patch_embed)(one_hot)
         tokens_per_grid = self.patch_embed.grid * self.patch_embed.grid
         return patch_tokens.reshape(bsz, num_grids * tokens_per_grid, -1)
+
+    def _apply_local_mixer(
+        self,
+        x: Float[Array, "B T D"],
+        attention_mask: Optional[Bool[Array, "B T"]],
+    ) -> Float[Array, "B T D"]:
+        if self.local_mixer is None:
+            return x
+        bsz, seq_len, dim = x.shape
+        grid = self.patch_embed.grid
+        tokens_per_grid = grid * grid
+        num_grids = seq_len // tokens_per_grid
+        x_grid = x.reshape(bsz, num_grids, grid, grid, dim)
+        x_grid = x_grid.reshape(bsz * num_grids, grid, grid, dim)
+        mask_grid = None
+        if attention_mask is not None:
+            mask_grid = attention_mask.reshape(bsz, num_grids, grid, grid)
+            mask_grid = mask_grid.reshape(bsz * num_grids, grid, grid)
+        y = self.local_mixer(x_grid, mask=mask_grid)
+        y = y.reshape(bsz, num_grids, grid, grid, dim).reshape(bsz, seq_len, dim)
+        return x + y
 
     def __call__(
         self,
@@ -117,6 +154,9 @@ class Model(eqx.Module):
         inference = inference or key is None
 
         x = self._embed_grids(grids)
+        if attention_mask is not None:
+            x = x * attention_mask.astype(x.dtype)[..., None]
+        x = self._apply_local_mixer(x, attention_mask)
         x = x.astype(self.dtype)
         x = self.drop(x, key=drop_key, inference=inference)
         x = self.blocks(
