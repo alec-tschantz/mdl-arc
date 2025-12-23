@@ -99,6 +99,7 @@ class Embedding(eqx.Module):
 class PatchEmbed(eqx.Module):
     conv: eqx.nn.Conv2d
     grid: int = eqx.field(static=True)
+    in_channels: int = eqx.field(static=True)
     embed_dim: int = eqx.field(static=True)
     patch_size: int = eqx.field(static=True)
     dtype: jnp.dtype = eqx.field(static=True)
@@ -107,18 +108,20 @@ class PatchEmbed(eqx.Module):
         self,
         image_size: int,
         patch_size: int,
+        in_channels: int,
         embed_dim: int,
         *,
         key: jax.Array,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.grid = image_size // patch_size
+        self.in_channels = in_channels
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.dtype = dtype
         param_dtype = jnp.float32
         self.conv = eqx.nn.Conv2d(
-            in_channels=embed_dim,
+            in_channels=in_channels,
             out_channels=embed_dim,
             kernel_size=patch_size,
             stride=patch_size,

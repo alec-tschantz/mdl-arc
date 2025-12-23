@@ -30,13 +30,13 @@ class Config:
     dropout: float = 0.1
     num_support: int = 4
     grid_size: int = 32
-    patch_size: int = 4
+    patch_size: int = 2
     pad_loss_weight: float = 0.0
     dtype: str = "bfloat16"
     seed: int = 0
     log_every: int = 10
     wandb_project: str = "arc-compare"
-    wandb_run_name: Optional[str] = "patch"
+    wandb_run_name: Optional[str] = "patch-2"
     max_grad_norm: float = 1.0
 
 

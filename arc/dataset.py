@@ -51,6 +51,26 @@ def _build_positions(num_support: int, grid_size: int, patch_size: int) -> np.nd
     return positions
 
 
+def _build_attention_mask(
+    grids: np.ndarray, grid_size: int, patch_size: int
+) -> np.ndarray:
+    grid = grid_size // patch_size
+    bsz, num_grids, _, _ = grids.shape
+    patches = grids.reshape(
+        bsz,
+        num_grids,
+        grid,
+        patch_size,
+        grid,
+        patch_size,
+    )
+    patches = np.transpose(patches, (0, 1, 2, 4, 3, 5))
+    patch_all_ignore = np.all(patches == IGNORE_TOKEN_ID, axis=(4, 5))
+    patch_mask = ~patch_all_ignore
+    patch_mask[:, -1, :] = True
+    return patch_mask.reshape(bsz, num_grids * grid * grid)
+
+
 class Dataset:
     def __init__(
         self,
@@ -86,9 +106,6 @@ class Dataset:
         self.num_samples = len(self.query_pairs)
 
         self.positions_template = _build_positions(num_support, grid_size, patch_size)
-        self.attention_mask_template = np.ones(
-            (self.positions_template.shape[0],), dtype=bool
-        )
 
     def _load_dir(self, directory: Path, *, merge_existing: bool) -> None:
         files = sorted(directory.glob("*.json"))
@@ -185,14 +202,14 @@ class Dataset:
             grids_arr = np.stack(grids_batch, axis=0).astype(np.int32)
             batch_size = grids_arr.shape[0]
 
+            attention_mask = _build_attention_mask(
+                grids_arr, self.grid_size, self.patch_size
+            )
             yield {
                 "grids": grids_arr,
                 "positions": np.broadcast_to(
                     self.positions_template,
                     (batch_size, self.positions_template.shape[0], 4),
                 ),
-                "attention_mask": np.broadcast_to(
-                    self.attention_mask_template,
-                    (batch_size, self.attention_mask_template.shape[0]),
-                ),
+                "attention_mask": attention_mask,
             }

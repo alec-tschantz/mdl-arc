@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
 from . import dataset as data
-from .nn import Embedding, PatchEmbed, LayerNorm, Linear, Transformer
+from .nn import PatchEmbed, LayerNorm, Linear, Transformer
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,6 @@ class ModelConfig:
 
 
 class Model(eqx.Module):
-    cell_embedding: Embedding
     patch_embed: PatchEmbed
     drop: eqx.nn.Dropout
     blocks: Transformer
@@ -60,11 +59,11 @@ class Model(eqx.Module):
 
         patch_grid = cfg.grid_size // cfg.patch_size
 
-        k_cell, k_patch, k_blocks, k_head = jax.random.split(key, 4)
-        self.cell_embedding = Embedding(cfg.vocab_size, cfg.d_model, key=k_cell)
+        k_patch, k_blocks, k_head = jax.random.split(key, 3)
         self.patch_embed = PatchEmbed(
             cfg.grid_size,
             cfg.patch_size,
+            cfg.vocab_size,
             cfg.d_model,
             key=k_patch,
             dtype=cfg.dtype,
@@ -94,9 +93,9 @@ class Model(eqx.Module):
     def _embed_grids(self, grids: Int[Array, "B G H W"]) -> Float[Array, "B T D"]:
         bsz, num_grids, height, width = grids.shape
         flat = grids.reshape(bsz * num_grids, height, width)
-        cell = self.cell_embedding(flat.astype(jnp.int32))
-        cell = jnp.transpose(cell, (0, 3, 1, 2))
-        patch_tokens = jax.vmap(self.patch_embed)(cell)
+        one_hot = jax.nn.one_hot(flat.astype(jnp.int32), self.vocab_size)
+        one_hot = jnp.transpose(one_hot, (0, 3, 1, 2))
+        patch_tokens = jax.vmap(self.patch_embed)(one_hot)
         tokens_per_grid = self.patch_embed.grid * self.patch_embed.grid
         return patch_tokens.reshape(bsz, num_grids * tokens_per_grid, -1)
 
@@ -145,7 +144,10 @@ def _patchify_grids(
     )
     grid = jnp.transpose(grid, (0, 1, 2, 4, 3, 5))
     patches = grid.reshape(
-        bsz, num_grids, (height // patch_size) * (width // patch_size), patch_size * patch_size
+        bsz,
+        num_grids,
+        (height // patch_size) * (width // patch_size),
+        patch_size * patch_size,
     )
     return patches.reshape(bsz, -1, patch_size * patch_size)
 
